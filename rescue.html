@@ -4930,75 +4930,91 @@ async function exportSessionToExcel() {
     }
 }
 
-function saveSessionFile() {
-    // 1. Notify User we are starting
-    const statusDiv = document.getElementById('bank-status'); // Re-using an existing element for status if avail
-    if(statusDiv) statusDiv.innerText = "⏳ Accessing Database...";
+async function saveSessionFile() {
+    const statusDiv = document.getElementById('bank-status');
+    if(statusDiv) statusDiv.innerText = "🔍 Scanning for Database...";
 
-    // 2. Open the Vault (IndexedDB)
-    const request = indexedDB.open('UltimateDealerDB', 1);
+    // 1. Feature Check
+    if (!indexedDB.databases) {
+        alert("Your browser is protecting the database name.\n\nPlease check your code for 'indexedDB.open('Name')' and tell me the Name.");
+        return;
+    }
 
-    request.onerror = (e) => {
-        alert("CRITICAL ERROR: Could not open database. Replays will be missing.");
-        downloadJSON({ gameState: game, fullHistory: [] });
-    };
-
-    request.onsuccess = (e) => {
-        const db = e.target.result;
+    try {
+        // 2. ASK BROWSER FOR DB NAMES
+        const dbs = await indexedDB.databases();
         
-        try {
-            // 3. Check if 'hands' store exists
-            if (!db.objectStoreNames.contains('hands')) {
-                alert("Database empty (No 'hands' store found). Saving stats only.");
-                downloadJSON({ gameState: game, fullHistory: [] });
+        if (dbs.length === 0) {
+            alert("Strange... The browser says no databases exist, yet Replays work.\n(Try playing 1 hand on this page and trying again).");
+            return;
+        }
+
+        // We assume the first found DB is the correct one (usually true for single-page apps)
+        const targetDB = dbs[0].name;
+        const targetVersion = dbs[0].version;
+        
+        // 3. OPEN THE FOUND DB
+        const request = indexedDB.open(targetDB, targetVersion);
+
+        request.onerror = (e) => {
+            alert(`Could not open database: ${targetDB}`);
+        };
+
+        request.onsuccess = (e) => {
+            const db = e.target.result;
+            
+            // 4. FIND THE STORE NAME (Don't guess 'hands')
+            const storeNames = Array.from(db.objectStoreNames);
+            if (storeNames.length === 0) {
+                alert(`Database '${targetDB}' is empty (No stores).`);
                 return;
             }
+            const targetStore = storeNames[0]; // Usually the first one is the history
 
-            const tx = db.transaction(['hands'], 'readonly');
-            const store = tx.objectStore('hands');
-            
-            // 4. Get ALL Replays
+            // 5. EXTRACT DATA
+            const tx = db.transaction([targetStore], 'readonly');
+            const store = tx.objectStore(targetStore);
             const getAllReq = store.getAll();
 
             getAllReq.onsuccess = () => {
                 const allHands = getAllReq.result || [];
                 
-                // --- DEBUG ALERT ---
-                // This tells you exactly how many replays are being saved
-                alert(`✅ FOUND ${allHands.length} REPLAYS!\n\nPacking them into the file now. This might take a few seconds...`);
+                // ALERT THE USER
+                const userConfirmed = confirm(
+                    `✅ SUCCESS!\n\n` +
+                    `Found Database: "${targetDB}"\n` +
+                    `Found Store: "${targetStore}"\n` +
+                    `Contains: ${allHands.length} Replays\n\n` +
+                    `Click OK to Download.`
+                );
 
-                // 5. Create the Master Package
-                const exportPackage = {
-                    version: "3.1", 
-                    timestamp: new Date().toISOString(),
-                    gameState: game,       // The Table State (Stacks, Players)
-                    fullHistory: allHands  // The Replay Data
-                };
-
-                // 6. Download
-                downloadJSON(exportPackage);
-                if(statusDiv) statusDiv.innerText = "✅ Save Complete!";
+                if (userConfirmed) {
+                    const exportPackage = {
+                        version: "3.2",
+                        timestamp: new Date().toISOString(),
+                        gameState: game,
+                        fullHistory: allHands,
+                        // Save these names so 'Import' knows them next time
+                        meta: { dbName: targetDB, storeName: targetStore } 
+                    };
+                    downloadJSON(exportPackage);
+                    if(statusDiv) statusDiv.innerText = "✅ Save Complete!";
+                }
             };
+        };
 
-            getAllReq.onerror = () => {
-                alert("Error reading history from DB. Saving lightweight version only.");
-                downloadJSON({ gameState: game, fullHistory: [] });
-            };
-
-        } catch (err) {
-            console.error(err);
-            alert("Error accessing database transaction. Saving stats only.");
-            downloadJSON({ gameState: game, fullHistory: [] });
-        }
-    };
+    } catch (err) {
+        console.error(err);
+        alert("Error scanning database: " + err.message);
+    }
 }
 
-// Helper to trigger download (Keep this if you don't have it)
+// Keep this helper
 function downloadJSON(data) {
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data));
     const downloadAnchorNode = document.createElement('a');
     downloadAnchorNode.setAttribute("href", dataStr);
-    downloadAnchorNode.setAttribute("download", "UltimateDealer_Session_" + new Date().toISOString().slice(0,10) + ".json");
+    downloadAnchorNode.setAttribute("download", "Rescue_Session_" + new Date().toISOString().slice(0,10) + ".json");
     document.body.appendChild(downloadAnchorNode);
     downloadAnchorNode.click();
     downloadAnchorNode.remove();
@@ -6051,4 +6067,5 @@ document.addEventListener('DOMContentLoaded', initWirelessSync);
     </div>
 </div>
 </body>
+
 </html>
