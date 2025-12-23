@@ -4111,48 +4111,80 @@ function undoLastAction() {
 			function replayStep(d) { const n = game.replayIndex + d; if(n >= 0 && n < game.activeReplayHand.length) { game.replayIndex = n; renderReplayStep(); } }
         
 		function loadReplay(identifier) {
-    // 1. Force the ID to be a Number (Crucial for IndexedDB lookup)
     const handId = Number(identifier);
 
-    // 2. Open using the CORRECT VERSION (2)
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    // Helper function that does the actual work once we know the Name
+    const performLookup = (targetDBName) => {
+        // Open WITHOUT version number (Opens whatever version exists on disk)
+        const req = indexedDB.open(targetDBName);
 
-    req.onsuccess = (e) => {
-        const db = e.target.result;
-        const tx = db.transaction('hands', 'readonly');
-        const store = tx.objectStore('hands');
-        
-        // 3. Fetch the full hand data
-        const getHand = store.get(handId);
-
-        getHand.onsuccess = () => {
-            const hand = getHand.result;
-
-            if (!hand || !hand.replayData) {
-                console.error("Replay Data not found for ID:", handId);
-                alert("Replay data not found for Hand #" + handId);
+        req.onsuccess = (e) => {
+            const db = e.target.result;
+            
+            // Safety Check: Does the store exist?
+            if (!db.objectStoreNames.contains('hands')) {
+                alert(`Error: Database '${targetDBName}' exists but 'hands' folder is missing.`);
                 return;
             }
 
-            // 4. Load data into memory
-            game.activeReplayHand = hand.replayData;
-            game.replayIndex = 0;
-            game.currentVisibleReplayDoc = hand; 
+            const tx = db.transaction('hands', 'readonly');
+            const store = tx.objectStore('hands');
+            const getHand = store.get(handId);
 
-            document.getElementById('replay-hand-id').innerText = hand.id;
+            getHand.onsuccess = () => {
+                const hand = getHand.result;
 
-            // 5. Switch UI
-            document.getElementById('modal-menu').classList.remove('open');
-            document.getElementById('modal-replay').classList.add('open');
+                // CHECK: Did we find the hand AND the replay data?
+                if (!hand || !hand.replayData) {
+                    console.error("Missing Replay Data for ID:", handId);
+                    alert(`Hand #${handId} found, but Replay Data is missing.\n(Did you export using the new 'Heavy' save?)`);
+                    return;
+                }
 
-            renderReplayStep();
+                // --- SUCCESS: LOAD DATA ---
+                game.activeReplayHand = hand.replayData;
+                game.replayIndex = 0;
+                game.currentVisibleReplayDoc = hand; 
+
+                const idDisplay = document.getElementById('replay-hand-id');
+                if(idDisplay) idDisplay.innerText = hand.id;
+
+                // --- SWITCH UI ---
+                const menu = document.getElementById('modal-menu');
+                if(menu) menu.classList.remove('open');
+                
+                document.getElementById('modal-replay').classList.add('open');
+
+                if(typeof renderReplayStep === 'function') {
+                    renderReplayStep();
+                } else {
+                    alert("Error: renderReplayStep function is missing!");
+                }
+            };
+        };
+
+        req.onerror = (err) => {
+            console.error("DB Error:", err);
+            alert("Could not open database: " + targetDBName);
         };
     };
-    
-    req.onerror = (err) => {
-        console.error("Database connection error:", err.target.error);
-        alert("Database Error: Make sure you are using Version 2 of the DB.");
-    };
+
+    // --- SMART NAME DETECTION ---
+    // We look for the database name dynamically to match the Import logic
+    if (indexedDB.databases) {
+        indexedDB.databases().then(dbs => {
+            if (dbs.length > 0) {
+                // Use the first DB found (Likely the one we just imported into)
+                performLookup(dbs[0].name);
+            } else {
+                // Fallback default
+                performLookup('UltimateDealerDB');
+            }
+        }).catch(() => performLookup('UltimateDealerDB'));
+    } else {
+        // Fallback for older browsers
+        performLookup('UltimateDealerDB');
+    }
 }
 		
 function renderReplayStep() {
@@ -5040,61 +5072,76 @@ function loadSessionFile(input) {
         try {
             const importedData = JSON.parse(e.target.result);
 
-            // A. Restore Game State (RAM)
+            // 1. Restore the easy stuff (RAM State)
             if (importedData.gameState) {
                 game = importedData.gameState;
-                // Force UI Update
-                saveLocal(); 
+                saveLocal();
                 renderTable();
                 renderStats('profit', 'basic');
-                if(typeof renderHistoryList === 'function') renderHistoryList();
-            } else {
-                // Legacy support
-                game = importedData;
-                renderTable();
             }
 
-            // B. Restore Replays (Database)
+            // 2. CHECK FOR REPLAYS
             if (importedData.fullHistory && importedData.fullHistory.length > 0) {
-                
                 const count = importedData.fullHistory.length;
-                // --- DEBUG ALERT ---
-                const proceed = confirm(`📂 File loaded!\n\nIt contains ${count} Replays.\n\nClick OK to inject them into this device's database.`);
+                
+                // CRITICAL: Read the correct DB Name from the file
+                // If the "Rescue" save didn't add meta, we try to detect it or fallback
+                const targetDB = (importedData.meta && importedData.meta.dbName) ? importedData.meta.dbName : 'UltimateDealerDB';
+                const targetStore = (importedData.meta && importedData.meta.storeName) ? importedData.meta.storeName : 'hands';
+
+                const proceed = confirm(`📂 File loaded (2MB).\n\nContains ${count} Replays.\nDestination: ${targetDB} (${targetStore})\n\nInject now?`);
                 if(!proceed) return;
 
-                const request = indexedDB.open('UltimateDealerDB', 1);
-                
+                // 3. Open the Specific Database
+                const request = indexedDB.open(targetDB);
+
+                // Handle "First Time" load (Create store if missing)
+                request.onupgradeneeded = (ev) => {
+                    const db = ev.target.result;
+                    if (!db.objectStoreNames.contains(targetStore)) {
+                        db.createObjectStore(targetStore, { keyPath: 'id' });
+                    }
+                };
+
                 request.onsuccess = (ev) => {
                     const db = ev.target.result;
-                    const tx = db.transaction(['hands'], 'readwrite');
-                    const store = tx.objectStore('hands');
+                    
+                    // Safety Check: Does the store exist?
+                    if (!db.objectStoreNames.contains(targetStore)) {
+                        alert(`Error: The database '${targetDB}' exists but is missing the '${targetStore}' section.\n\nTry playing one hand first to initialize the app.`);
+                        return;
+                    }
+
+                    const tx = db.transaction([targetStore], 'readwrite');
+                    const store = tx.objectStore(targetStore);
                     
                     let successCount = 0;
                     
                     importedData.fullHistory.forEach(handRecord => {
-                        store.put(handRecord); // Insert or Overwrite
+                        store.put(handRecord);
                         successCount++;
                     });
 
                     tx.oncomplete = () => {
-                        alert(`✅ SUCCESS!\n\nRestored ${successCount} replays.\n\nYou can now view replays on this device.`);
+                        alert(`✅ SUCCESS!\n\nRestored ${successCount} replays into '${targetDB}'.\n\nTry clicking Replay now!`);
                     };
                     
                     tx.onerror = (err) => {
-                        alert("Error writing to database: " + err.target.error);
+                        console.error(err);
+                        alert("Database Write Error. Check console.");
                     };
                 };
             } else {
-                alert("⚠️ Loaded Game State, but NO REPLAYS were found in this file.\n\n(Did you save it using the old version?)");
+                alert("File loaded, but it contains 0 Replays.\n(Are you sure this is the 2MB file?)");
             }
 
         } catch (err) {
             console.error(err);
-            alert("Error parsing JSON file. It might be corrupted.");
+            alert("Error parsing file.");
         }
     };
     reader.readAsText(file);
-    input.value = ''; // Reset input
+    input.value = ''; 
 }
 		function setHistoryPlayerFilter(val) {
             game.historyPlayerFilter = val;
@@ -6069,3 +6116,4 @@ document.addEventListener('DOMContentLoaded', initWirelessSync);
 </body>
 
 </html>
+
